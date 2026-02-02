@@ -4,12 +4,53 @@ import ffmpeg
 import folder_paths
 
 
+class VideoOutput:
+    def __init__(self, video_path):
+        self.video_path = video_path
+
+    def get_dimensions(self):
+        try:
+            probe = ffmpeg.probe(self.video_path)
+            video_info = next(s for s in probe["streams"] if s["codec_type"] == "video")
+            return int(video_info["width"]), int(video_info["height"])
+        except Exception:
+            return 0, 0
+
+    def save_to(self, path, format=None, codec=None, metadata=None):
+        # Simply copy the concatenation result to the final path
+        # If format conversion is requested by SaveVideo, we might need ffmpeg here
+        # But usually VideoConcatenation already did the hard work.
+
+        # Determine if we need to re-encode or just copy
+        # The internal file is already in a temp path with a format.
+        try:
+            # We will use ffmpeg to ensure the target format/codec is respected
+            # if provided by the save node.
+
+            stream = ffmpeg.input(self.video_path)
+            # Basic copy if no specific codec requested or if it matches
+            output_args = {"c": "copy"}
+
+            # If codec/format is strictly requested by the SaveVideo node (which usually passes objects)
+            # The 'format' arg here is likely a complicated Comfy object based on the traceback (Types.VideoContainer)
+            # We'll do a simple copy for now as a robust baseline,
+            # assuming the user set the right extension in VideoConcatenation.
+            # If strictly needed, we can re-encode.
+
+            ffmpeg.output(stream, path, **output_args).overwrite_output().run()
+        except Exception as e:
+            print(f"[Video Concatenation] Error saving to final path: {e}")
+            # Fallback copy
+            import shutil
+
+            shutil.copy(self.video_path, path)
+
+
 class VideoConcatenation:
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
-                "filename_prefix": ("STRING", {"default": "concatenated_video"}),
                 "transition_type": (
                     [
                         "none",
@@ -36,23 +77,27 @@ class VideoConcatenation:
                     "FLOAT",
                     {"default": 1.0, "min": 0.1, "max": 10.0, "step": 0.1},
                 ),
+                "output_format": (
+                    ["mp4", "mkv", "mov", "webm", "avi", "gif"],
+                    {"default": "mp4"},
+                ),
             },
             "optional": {
-                "video1": ("*", {"forceInput": True}),
-                "video2": ("*", {"forceInput": True}),
-                "video3": ("*", {"forceInput": True}),
-                "video4": ("*", {"forceInput": True}),
-                "video5": ("*", {"forceInput": True}),
+                "video1": ("VIDEO",),
+                "video2": ("VIDEO",),
+                "video3": ("VIDEO",),
+                "video4": ("VIDEO",),
+                "video5": ("VIDEO",),
             },
         }
 
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("video_path",)
-    OUTPUT_NODE = True
+    RETURN_TYPES = ("VIDEO",)
+    RETURN_NAMES = ("video",)
+    OUTPUT_NODE = False
     FUNCTION = "merge_videos"
     CATEGORY = "Video Concatenation"
 
-    def merge_videos(self, filename_prefix, **kwargs):
+    def merge_videos(self, **kwargs):
         # Collect all provided video paths
         video_list = []
         for i in range(1, 6):
@@ -91,6 +136,9 @@ class VideoConcatenation:
                             print(
                                 f"[Video Concatenation] Concatenation error calling get_stream_source: {e}"
                             )
+                    # Handle our own VideoOutput class (recursive concatenation)
+                    elif hasattr(obj, "video_path"):
+                        paths.append(obj.video_path)
 
                     if not paths:
                         # Fallback: check common attributes
@@ -152,7 +200,7 @@ class VideoConcatenation:
                 if resolved and os.path.exists(resolved):
                     valid_videos.append(resolved)
                     continue
-            except:
+            except Exception:
                 pass
 
             print(
@@ -165,23 +213,15 @@ class VideoConcatenation:
             )
             return (None,)
 
-        # Get output directory from ComfyUI
-        output_dir = folder_paths.get_output_directory()
+        # Get output directory from ComfyUI (used for temp file)
+        output_dir = folder_paths.get_temp_directory()
         if not os.path.exists(output_dir):
             os.makedirs(output_dir, exist_ok=True)
 
-        # Generate filename: prefix_YYYYMMDD_sequence.mp4
-        today = datetime.datetime.now().strftime("%Y%m%d")
-
-        sequence = 1
-        output_path = ""
-        filename = ""
-        while True:
-            filename = f"{filename_prefix}_{today}_{sequence:02d}.mp4"
-            output_path = os.path.join(output_dir, filename)
-            if not os.path.exists(output_path):
-                break
-            sequence += 1
+        # Generate temp filename
+        today = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+        output_format = kwargs.get("output_format", "mp4")
+        output_path = os.path.join(output_dir, f"concat_temp_{today}.{output_format}")
 
         # Probe video durations if transitions are enabled
         transition_mode = kwargs.get("transition_type", "none")
@@ -202,7 +242,7 @@ class VideoConcatenation:
                     break
 
         print(
-            f"[Video Concatenation] Merging {len(valid_videos)} videos into {output_path}... (Transition: {transition_mode})"
+            f"[Video Concatenation] Merging {len(valid_videos)} videos... (Transition: {transition_mode})"
         )
 
         success = False
@@ -216,7 +256,29 @@ class VideoConcatenation:
                     streams.append(input_node.audio)
 
                 joined = ffmpeg.concat(*streams, v=1, a=1).node
-                out = ffmpeg.output(joined[0], joined[1], output_path)
+
+                # Define encoding arguments based on format
+                output_args = {}
+                if output_format in ["mp4", "mkv", "mov"]:
+                    output_args = {
+                        "vcodec": "libx264",
+                        "crf": "23",
+                        "preset": "medium",
+                        "pix_fmt": "yuv420p",  # Critical for Windows 11 compatibility
+                    }
+                elif output_format == "avi":
+                    output_args = {
+                        "vcodec": "mpeg4",
+                        "qscale:v": "3",  # High quality variable bitrate
+                    }
+                elif output_format == "webm":
+                    output_args = {
+                        "vcodec": "libvpx-vp9",
+                        "crf": "30",
+                        "b:v": "0",
+                    }
+
+                out = ffmpeg.output(joined[0], joined[1], output_path, **output_args)
                 out.overwrite_output().run(capture_stdout=True, capture_stderr=True)
             else:
                 # Advanced xfade concat
@@ -229,14 +291,8 @@ class VideoConcatenation:
                     a_streams.append(inp.audio)  # Assuming audio exists for now
 
                 # 2. Build filter graph
-                # Start with the first stream
                 curr_v = v_streams[0]
                 curr_a = a_streams[0]
-
-                # Offset starts at the end of the first video minus transition time
-                # Offset for transition N (between video N and N+1)
-                # O(0) = D(0) - T
-                # O(1) = O(0) + D(1) - T
                 current_offset = video_durations[0] - transition_time
 
                 for i in range(1, len(valid_videos)):
@@ -244,7 +300,6 @@ class VideoConcatenation:
                     next_a = a_streams[i]
 
                     # Apply xfade
-                    # [v0][v1]xfade=transition=fade:duration=1:offset=time[vt]
                     curr_v = ffmpeg.filter(
                         [curr_v, next_v],
                         "xfade",
@@ -254,8 +309,6 @@ class VideoConcatenation:
                     )
 
                     # Apply acrossfade for audio
-                    # [a0][a1]acrossfade=d=1[at]
-                    # Note: acrossfade doesn't need explicit offset, it just overlaps ends
                     curr_a = ffmpeg.filter(
                         [curr_a, next_a], "acrossfade", d=transition_time
                     )
@@ -265,9 +318,28 @@ class VideoConcatenation:
                         current_offset += video_durations[i] - transition_time
 
                 # 3. Output
-                out = ffmpeg.output(curr_v, curr_a, output_path)
+                output_args = {}
+                if output_format in ["mp4", "mkv", "mov"]:
+                    output_args = {
+                        "vcodec": "libx264",
+                        "crf": "23",
+                        "preset": "medium",
+                        "pix_fmt": "yuv420p",  # Critical for Windows 11 compatibility
+                    }
+                elif output_format == "avi":
+                    output_args = {
+                        "vcodec": "mpeg4",
+                        "qscale:v": "3",
+                    }
+                elif output_format == "webm":
+                    output_args = {
+                        "vcodec": "libvpx-vp9",
+                        "crf": "30",
+                        "b:v": "0",
+                    }
+
+                out = ffmpeg.output(curr_v, curr_a, output_path, **output_args)
                 out.overwrite_output().run(capture_stdout=True, capture_stderr=True)
-            print(f"[Video Concatenation] Successfully merged videos: {output_path}")
             success = True
 
         except ffmpeg.Error as e:
@@ -276,31 +348,39 @@ class VideoConcatenation:
             )
             try:
                 streams = [ffmpeg.input(v).video for v in valid_videos]
+                output_args = {}
+                if output_format in ["mp4", "mkv", "mov"]:
+                    output_args = {
+                        "vcodec": "libx264",
+                        "crf": "23",
+                        "preset": "medium",
+                        "pix_fmt": "yuv420p",
+                    }
+                elif output_format == "avi":
+                    output_args = {
+                        "vcodec": "mpeg4",
+                        "qscale:v": "3",
+                    }
+                elif output_format == "webm":
+                    output_args = {
+                        "vcodec": "libvpx-vp9",
+                        "crf": "30",
+                        "b:v": "0",
+                    }
                 ffmpeg.concat(*streams, v=1, a=0).output(
-                    output_path
+                    output_path, **output_args
                 ).overwrite_output().run(capture_stdout=True, capture_stderr=True)
-                print(
-                    f"[Video Concatenation] Successfully merged videos (video-only): {output_path}"
-                )
                 success = True
             except ffmpeg.Error as e2:
                 print(
                     f"[Video Concatenation] Critical error merging videos: {e2.stderr.decode() if e2.stderr else 'unknown'}"
                 )
-                return ("",)
+                return (None,)
         except Exception as e:
             print(f"[Video Concatenation] Unexpected error: {str(e)}")
-            return ("",)
+            return (None,)
 
-        if success:
-            # Result for UI preview (similar to Save Video nodes)
-            results = {
-                "ui": {
-                    "videos": [
-                        {"filename": filename, "subfolder": "", "type": "output"}
-                    ]
-                }
-            }
-            return {"result": (output_path,), "ui": results["ui"]}
+        if success and os.path.exists(output_path):
+            return (VideoOutput(output_path),)
 
-        return ("",)
+        return (None,)
